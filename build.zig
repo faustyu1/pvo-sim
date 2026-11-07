@@ -2,6 +2,16 @@ const std = @import("std");
 
 const raylib_src = "vendor/raylib/src";
 
+/// When targeting macOS explicitly (e.g. x86_64-macos on an arm64 Mac), Zig does
+/// not look up the SDK by itself, so point it at the one xcrun reports.
+fn addMacSdk(b: *std.Build, mod: *std.Build.Module) void {
+    if (@import("builtin").os.tag != .macos) return;
+    const sdk = std.mem.trim(u8, b.run(&.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" }), " \n\r");
+    mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
+    mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
+}
+
 /// raylib 6.2 is vendored in vendor/raylib and compiled from source with
 /// zig cc, so the game builds the same way on macOS, Windows and Linux.
 fn buildRaylib(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
@@ -26,6 +36,7 @@ fn buildRaylib(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     });
     switch (os) {
         .macos => {
+            addMacSdk(b, mod);
             // rglfw.c pulls in the Cocoa backend, which is Objective-C
             mod.addCSourceFile(.{ .file = b.path(raylib_src ++ "/rglfw.c"), .flags = &.{ "-std=c99", "-ObjC" } });
             for ([_][]const u8{ "Foundation", "CoreServices", "CoreGraphics", "AppKit", "IOKit", "QuartzCore", "CoreVideo", "OpenGL", "CoreAudio", "AudioToolbox" }) |f|
@@ -66,6 +77,7 @@ pub fn build(b: *std.Build) void {
     });
     mod.addImport("c", tc.createModule());
     mod.linkLibrary(raylib);
+    if (target.result.os.tag == .macos) addMacSdk(b, mod);
 
     const exe = b.addExecutable(.{ .name = "pvo", .root_module = mod });
     // no console window on Windows
