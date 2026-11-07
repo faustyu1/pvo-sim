@@ -59,6 +59,7 @@ Models are generated procedurally in Blender (ambient occlusion is baked into ve
 - Mouse: aim. LMB: fire.
 - Wheel or Z: sight zoom.
 - The laser rangefinder locks the target nearest the crosshair and sets the shell fuse. Put the crosshair on the small circle (the lead point), not on the target itself.
+- Shells are simulated with air drag and gravity (1050 m/s at the muzzle, about 700 m/s at 2 km) and burst on a timed fuse. The lead point accounts for both. Every second round is a tracer.
 - F: launch a SAM at the target in the sight. T: toggle auto-SAM, which is switched off when you take the seat.
 - V: back to the commander view.
 

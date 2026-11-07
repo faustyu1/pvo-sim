@@ -26,6 +26,13 @@ const MAX_PROPS = 96;
 const RADAR_RANGE: f32 = 9000;
 const GUN_RANGE: f32 = 3300;
 const SHELL_SPEED: f32 = 1050;
+/// Quadratic air drag for the 35 mm shell: dv/dx = -k v, so v drops to ~2/3 by 2 km.
+const SHELL_DRAG: f32 = 0.0002;
+
+/// Time of flight to a given slant range, with drag.
+fn shellTof(d: f32) f32 {
+    return (@exp(SHELL_DRAG * d) - 1) / (SHELL_DRAG * SHELL_SPEED);
+}
 
 // ============================================================ helpers
 fn col(r: u8, gg: u8, b: u8, a: u8) c.Color {
@@ -247,6 +254,7 @@ const Shell = struct {
     vel: V3 = vm.zero,
     fuse: f32 = 0,
     t: f32 = 0,
+    tracer: bool = false,
 };
 
 const Part = struct {
@@ -308,6 +316,8 @@ const Game = struct {
     gBurst: i32 = 0,
     gPause: f32 = 0,
     gBarrel: u1 = 0,
+    gRecoil: f32 = 0,
+    gRound: u32 = 0,
     gAuto: bool = true,
     gTgt: i32 = -1,
 
@@ -1643,8 +1653,14 @@ fn spaagTurretXf() Xf {
 fn spaagGunsXf() Xf {
     return spaagTurretXf().mul(vm.yawPitch(SPAAG_TRUNNION, 0, g.gPitch));
 }
+/// Gun model transform with recoil kick (the fire-control math uses the unrecoiled one).
+fn spaagGunsDrawXf() Xf {
+    const xf = spaagGunsXf();
+    return .{ .p = vm.mad(xf.p, xf.x, -0.18 * g.gRecoil), .x = xf.x, .y = xf.y, .z = xf.z };
+}
 
 fn updateGun(dt: f32) void {
+    g.gRecoil = @max(0, g.gRecoil - dt * 14);
     if (g.gAmmo <= 0) {
         g.gReload += dt;
         if (g.gReload > 15) {
@@ -1684,7 +1700,7 @@ fn updateGun(dt: f32) void {
         var aim = t.pos;
         var k: usize = 0;
         while (k < 4) : (k += 1) {
-            tof = vm.dist(aim, gunPos) / SHELL_SPEED;
+            tof = shellTof(vm.dist(aim, gunPos));
             aim = vm.mad(t.pos, t.vel, tof);
         }
         aim.y += 0.5 * G * tof * tof;
@@ -1731,7 +1747,7 @@ fn leadPoint(t: *const Target, from: V3) struct { aim: V3, tof: f32 } {
     var tof: f32 = 0;
     var k: usize = 0;
     while (k < 4) : (k += 1) {
-        tof = vm.dist(aim, from) / SHELL_SPEED;
+        tof = shellTof(vm.dist(aim, from));
         aim = vm.mad(t.pos, t.vel, tof);
     }
     aim.y += 0.5 * G * tof * tof;
@@ -1764,7 +1780,7 @@ fn updateGunManual(dt: f32, gunPos: V3) void {
     }
     g.gLock = best;
     // fuse on the intercept point, not the current target position
-    if (best >= 0) g.gRange = leadPoint(&targets[@intCast(best)], gunPos).tof * SHELL_SPEED;
+    if (best >= 0) g.gRange = vm.dist(leadPoint(&targets[@intCast(best)], gunPos).aim, gunPos);
 
     g.gYaw = vm.approachAngle(g.gYaw, g.gAimYaw, 120 * vm.deg * dt);
     g.gPitch = vm.approachAngle(g.gPitch, vm.clampf(g.gAimPitch, -0.05, 1.45), 90 * vm.deg * dt);
@@ -1773,7 +1789,7 @@ fn updateGunManual(dt: f32, gunPos: V3) void {
     if (g.gTrigger and g.gAmmo > 0) {
         while (g.gFireT <= 0) {
             g.gFireT += 0.055;
-            fireShell(g.gRange / SHELL_SPEED);
+            fireShell(shellTof(g.gRange));
         }
     }
     if (g.gFireT < 0) g.gFireT = 0;
@@ -1799,6 +1815,7 @@ fn enterGunner(on: bool) void {
 }
 
 var noMouse = false; // screenshot runs: ignore whatever the real mouse does
+var forceFire = false;
 
 fn gunnerInput() void {
     const md = if (noMouse) vm.v2(0, 0) else c.GetMouseDelta();
@@ -1809,7 +1826,7 @@ fn gunnerInput() void {
     const wheel = c.GetMouseWheelMove();
     g.gFov = vm.clampf(g.gFov * @exp(-wheel * 0.15), 4, 55);
     if (c.IsKeyPressed(c.KEY_Z)) g.gFov = if (g.gFov > 12) 8 else 40;
-    g.gTrigger = c.IsMouseButtonDown(c.MOUSE_BUTTON_LEFT);
+    g.gTrigger = c.IsMouseButtonDown(c.MOUSE_BUTTON_LEFT) or forceFire;
     if (c.IsKeyPressed(c.KEY_F) or c.IsKeyPressed(c.KEY_SPACE)) {
         // hand the locked target to the SAM battery
         if (g.gLock >= 0 and tracked(&targets[@intCast(g.gLock)])) {
@@ -1838,29 +1855,46 @@ fn fireShell(tof: f32) void {
     const xf = spaagGunsXf();
     const side: f32 = if (g.gBarrel == 0) -1.42 else 1.42;
     g.gBarrel +%= 1;
-    const muzzle = xf.point(v3(4.2, 0.05, side));
+    g.gRound +%= 1;
+    g.gRecoil = 1;
+    const muzzle = xf.point(v3(4.3, 0.05, side));
     const disp = vm.scale(vm.rndDir(), 0.0025);
     const dir = vm.norm(vm.add(xf.x, disp));
     for (&shells) |*s| {
         if (s.alive) continue;
-        s.* = .{ .alive = true, .pos = muzzle, .vel = vm.scale(dir, SHELL_SPEED), .fuse = tof + vm.rr(-0.02, 0.02) };
+        s.* = .{ .alive = true, .pos = muzzle, .vel = vm.scale(dir, SHELL_SPEED), .fuse = tof + vm.rr(-0.02, 0.02), .tracer = g.gRound % 2 == 0 };
         break;
     }
-    spawnPart(.{ .pos = muzzle, .life = 0.06, .s0 = 3.0, .s1 = 1.5, .c0 = .{ 1, 0.85, 0.5, 1 }, .c1 = .{ 1, 0.5, 0.1, 0 }, .add = true });
-    if (vm.rnd() < 0.4) smoke(muzzle, vm.add(vm.scale(dir, 6), vm.scale(vm.rndDir(), 1)), 1.5, 0.8, 3.5, 0.75, 0.3);
+    // muzzle flash: a short cone of fire along the barrel plus side jets from the brake
+    const fl = vm.rr(0.8, 1.2);
+    spawnPart(.{ .pos = vm.mad(muzzle, dir, 0.4), .life = 0.05, .s0 = 2.2 * fl, .s1 = 1.2, .c0 = .{ 1, 0.9, 0.6, 1 }, .c1 = .{ 1, 0.5, 0.1, 0 }, .add = true });
+    spawnPart(.{ .pos = vm.mad(muzzle, dir, 1.3), .life = 0.045, .s0 = 1.6 * fl, .s1 = 0.6, .c0 = .{ 1, 0.75, 0.35, 1 }, .c1 = .{ 1, 0.35, 0.05, 0 }, .add = true });
+    spawnPart(.{ .pos = vm.mad(muzzle, dir, 2.3), .life = 0.04, .s0 = 0.9 * fl, .s1 = 0.3, .c0 = .{ 1, 0.6, 0.25, 0.8 }, .c1 = .{ 1, 0.3, 0.05, 0 }, .add = true });
+    const sideV = vm.norm(vm.cross(dir, v3(0, 1, 0)));
+    for ([_]f32{ -1, 1 }) |k| spawnPart(.{ .pos = vm.mad(muzzle, sideV, k * 0.5), .life = 0.04, .s0 = 0.9, .s1 = 0.3, .c0 = .{ 1, 0.7, 0.3, 0.8 }, .c1 = .{ 1, 0.3, 0.05, 0 }, .add = true });
+    if (vm.rnd() < 0.5) smoke(vm.mad(muzzle, dir, 1.0), vm.add(vm.scale(dir, 8), vm.scale(vm.rndDir(), 1.5)), 1.8, 0.9, 4.5, 0.7, 0.28);
 }
 
 fn updateShells(dt: f32) void {
     for (&shells) |*s| {
         if (!s.alive) continue;
         s.t += dt;
+        const sp = vm.len(s.vel);
+        s.vel = vm.scale(s.vel, @max(0, 1 - SHELL_DRAG * sp * dt));
         s.vel.y -= G * dt;
         s.pos = vm.mad(s.pos, s.vel, dt);
         if (s.t >= s.fuse or s.t > 4) {
             s.alive = false;
             // AHEAD-style airburst: dark flak puff + fragment cone
             smoke(s.pos, vm.scale(vm.rndDir(), 1), vm.rr(3, 5), 1.5, 5.5, 0.13, 0.85);
-            spawnPart(.{ .pos = s.pos, .life = 0.08, .s0 = 3.5, .s1 = 1, .c0 = .{ 1, 0.8, 0.5, 1 }, .c1 = .{ 1, 0.4, 0.1, 0 }, .add = true });
+            spawnPart(.{ .pos = s.pos, .life = 0.09, .s0 = 4.5, .s1 = 1.5, .c0 = .{ 1, 0.85, 0.55, 1 }, .c1 = .{ 1, 0.4, 0.1, 0 }, .add = true });
+            // tungsten sub-projectile cone: a few hot sparks thrown forward
+            const fwd = vm.norm(s.vel);
+            var k: usize = 0;
+            while (k < 5) : (k += 1) {
+                const v = vm.add(vm.scale(fwd, vm.rr(60, 120)), vm.scale(vm.rndDir(), 45));
+                spawnPart(.{ .pos = s.pos, .vel = v, .life = vm.rr(0.15, 0.3), .s0 = 0.5, .s1 = 0.15, .c0 = .{ 1, 0.8, 0.4, 1 }, .c1 = .{ 1, 0.3, 0.05, 0 }, .add = true, .drag = 3 });
+            }
             for (&targets, 0..) |*t, i| {
                 if (!t.alive or t.dying) continue;
                 const d = vm.dist(t.pos, s.pos);
@@ -2209,7 +2243,7 @@ fn drawScene(camPos: V3, shadowPass: bool, focus: V3) void {
     drawYaw(M.spaag_base, spaagPos, spaagYaw, 1);
     if (!g.gunner or shadowPass) {
         drawXf(M.spaag_turret, spaagTurretXf(), 1);
-        drawXf(M.spaag_guns, spaagGunsXf(), 1);
+        drawXf(M.spaag_guns, spaagGunsDrawXf(), 1);
     }
     // airborne
     for (&targets) |*t| {
@@ -2228,16 +2262,70 @@ fn drawScene(camPos: V3, shadowPass: bool, focus: V3) void {
     }
 }
 
-fn drawTracers(cam: c.Camera3D) void {
-    c.BeginBlendMode(c.BLEND_ADDITIVE);
-    c.rlDisableDepthMask();
-    for (&shells) |*s| {
-        if (!s.alive) continue;
-        const tail = vm.mad(s.pos, s.vel, -0.035);
-        const f = 1 - fogFactor(s.pos, cam.position);
-        c.DrawLine3D(tail, s.pos, colf(1.0 * f, 0.75 * f, 0.35 * f, 1));
-        c.DrawBillboard(cam, puff, s.pos, 0.9, colf(1.0 * f, 0.7 * f, 0.3 * f, 1));
+/// Camera-facing quad from a to b, glow falls off across the width (puff texture).
+fn ribbon(cam: c.Camera3D, a: V3, b: V3, w: f32, ca: c.Color, cb: c.Color) void {
+    const d = vm.sub(b, a);
+    const mid = vm.lerp(a, b, 0.5);
+    var side = vm.cross(d, vm.sub(cam.position, mid));
+    const l = vm.len(side);
+    if (l < 1e-5) return;
+    side = vm.scale(side, w / l);
+    c.rlColor4ub(ca.r, ca.g, ca.b, ca.a);
+    c.rlTexCoord2f(0, 0.5);
+    c.rlVertex3f(a.x - side.x, a.y - side.y, a.z - side.z);
+    c.rlTexCoord2f(1, 0.5);
+    c.rlVertex3f(a.x + side.x, a.y + side.y, a.z + side.z);
+    c.rlColor4ub(cb.r, cb.g, cb.b, cb.a);
+    c.rlTexCoord2f(1, 0.5);
+    c.rlVertex3f(b.x + side.x, b.y + side.y, b.z + side.z);
+    c.rlTexCoord2f(0, 0.5);
+    c.rlVertex3f(b.x - side.x, b.y - side.y, b.z - side.z);
+}
+
+/// Camera-facing square sprite (same batch as ribbons).
+fn sprite(p: V3, right: V3, up: V3, size: f32, cc: c.Color) void {
+    const r = vm.scale(right, size);
+    const u = vm.scale(up, size);
+    c.rlColor4ub(cc.r, cc.g, cc.b, cc.a);
+    const corners = [_][4]f32{ .{ -1, -1, 0, 1 }, .{ 1, -1, 1, 1 }, .{ 1, 1, 1, 0 }, .{ -1, 1, 0, 0 } };
+    for (corners) |k| {
+        c.rlTexCoord2f(k[2], k[3]);
+        const q = vm.add(p, vm.add(vm.scale(r, k[0]), vm.scale(u, k[1])));
+        c.rlVertex3f(q.x, q.y, q.z);
     }
+}
+
+fn drawTracers(cam: c.Camera3D) void {
+    const fw = vm.norm(vm.sub(cam.target, cam.position));
+    const right = vm.norm(vm.cross(fw, v3(0, 1, 0)));
+    const up = vm.cross(right, fw);
+    // alpha blend, not additive: additive glow vanishes against the bright overcast sky
+    c.BeginBlendMode(c.BLEND_ALPHA);
+    c.rlDisableDepthMask();
+    c.rlDisableBackfaceCulling();
+    c.rlSetTexture(puff.id);
+    c.rlBegin(c.RL_QUADS);
+    for (&shells) |*s| {
+        if (!s.alive or !s.tracer) continue;
+        if (s.t < 0.008) continue;
+        // the tracer compound burns out after ~3 s
+        const burn = 1 - vm.smooth(2.4, 3.2, s.t);
+        const dist = vm.dist(s.pos, cam.position);
+        const f = (1 - fogFactor(s.pos, cam.position) * 0.85) * burn;
+        if (f < 0.02) continue;
+        // streak length mimics eye/camera persistence; width keeps it visible far away
+        const w = @max(0.14, dist * 0.0014);
+        const a1: u8 = @intFromFloat(200 * f);
+        const a2: u8 = @intFromFloat(255 * f);
+        ribbon(cam, vm.mad(s.pos, s.vel, 0.004), vm.mad(s.pos, s.vel, -0.03), w * 3.0, col(255, 110, 25, a1), col(255, 60, 10, 0));
+        ribbon(cam, s.pos, vm.mad(s.pos, s.vel, -0.02), w, col(255, 235, 170, a2), col(255, 140, 40, 0));
+        // glowing head: keeps the tracer visible when it flies straight away from the camera
+        sprite(s.pos, right, up, w * 3.5, col(255, 120, 30, a1));
+        sprite(s.pos, right, up, w * 1.4, col(255, 240, 190, a2));
+    }
+    c.rlEnd();
+    c.rlSetTexture(0);
+    c.rlEnableBackfaceCulling();
     c.rlEnableDepthMask();
     c.EndBlendMode();
 }
@@ -3204,12 +3292,21 @@ pub fn main() void {
         enterGunner(true);
         c.EnableCursor();
         noMouse = true;
+        forceFire = c.getenv("PVO_FIRE") != null;
         const t = &targets[0];
         const d = vm.sub(t.pos, gunnerEye());
         g.gAimYaw = vm.wrapPi(vm.yawOf(d) - spaagYaw);
         g.gAimPitch = vm.pitchOf(d);
         g.gYaw = g.gAimYaw;
         g.gPitch = g.gAimPitch;
+        if (c.getenv("PVO_SIDE") != null) {
+            // side view of the gun firing: hand it back to the automatic fire control
+            g.gunner = false;
+            g.camFocus = vm.add(spaagPos, v3(0, 25, 0));
+            g.camDist = 70;
+            g.camPitch = 0.12;
+            g.camYaw = vm.yawOf(vm.sub(t.pos, spaagPos)) + 2.0;
+        }
         const fe = c.getenv("PVO_FOV");
         if (fe != null) g.gFov = @floatFromInt(c.atoi(fe));
     } else if (shotFrames > 0 and scene == 2) {
