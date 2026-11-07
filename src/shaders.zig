@@ -95,8 +95,12 @@ pub const lit_fs =
     \\    float slope = 1.0 - n.y;
     \\    vec2 q = p.xz;
     \\    float big = vc.g; // low-frequency noise baked per vertex
-    \\    float det = fbm(q * 0.06);
-    \\    float fine = n2(q * 0.7);
+    \\    // distance LOD: past ~2 km the fog hides fine noise, so skip computing it
+    \\    float dv = length(p - viewPos);
+    \\    float det = 0.5;
+    \\    if (dv < 2200.0) det = mix(fbm(q * 0.06), 0.5, smoothstep(1600.0, 2200.0, dv));
+    \\    float fine = 0.5;
+    \\    if (dv < 900.0) fine = mix(n2(q * 0.7), 0.5, smoothstep(600.0, 900.0, dv));
     \\    vec3 grassA = vec3(0.26, 0.26, 0.20);
     \\    vec3 grassB = vec3(0.40, 0.35, 0.26);
     \\    vec3 col = mix(grassA, grassB, smoothstep(0.3, 0.7, big)) * (0.82 + 0.3 * det) * (0.95 + 0.1 * fine);
@@ -122,11 +126,7 @@ pub const lit_fs =
     \\    // rock & snow
     \\    col = mix(col, vec3(0.44, 0.41, 0.37) * (0.8 + 0.4 * det), smoothstep(0.22, 0.42, slope));
     \\    col = mix(col, vec3(0.66, 0.68, 0.71), smoothstep(520.0, 640.0, p.y + det * 90.0) * (1.0 - smoothstep(0.35, 0.55, slope)));
-    \\    // gravel pad at the battery
-    \\    float pad = 1.0 - smoothstep(50.0, 56.0, length(q + vec2(det * 6.0)));
-    \\    float grit = n2(q * 3.1) * 0.5 + n2(q * 0.35) * 0.5;
-    \\    vec3 padCol = mix(vec3(0.24, 0.23, 0.21), vec3(0.36, 0.34, 0.31), grit);
-    \\    padCol = mix(padCol, col * 0.8, smoothstep(0.55, 0.75, n2(q * 0.08)) * 0.6);
+    \\    vec3 preRoad = col;
     \\    // roads (pad drawn on top, so the battery sits on a clean gravel area)
     \\    for (int i = 0; i < 8; i++) {
     \\        if (i >= roadCount) break;
@@ -136,11 +136,19 @@ pub const lit_fs =
     \\        col = mix(col, vec3(0.22, 0.22, 0.23) * (0.9 + 0.2 * fine), 1.0 - smoothstep(w - 0.6, w, d));
     \\        if (i == 4) col = mix(col, vec3(0.75, 0.72, 0.62), (1.0 - smoothstep(0.1, 0.25, d)) * step(0.5, fract(dot(q, normalize(roads[i].zw - roads[i].xy)) / 12.0)));
     \\    }
-    \\    col = mix(col, padCol, pad);
+    \\    // gravel pad at the battery (only evaluated near it)
+    \\    if (dot(q, q) < 70.0 * 70.0) {
+    \\        float pad = 1.0 - smoothstep(50.0, 56.0, length(q + vec2(det * 6.0)));
+    \\        float grit = n2(q * 3.1) * 0.5 + n2(q * 0.35) * 0.5;
+    \\        vec3 padCol = mix(vec3(0.24, 0.23, 0.21), vec3(0.36, 0.34, 0.31), grit);
+    \\        padCol = mix(padCol, preRoad * 0.8, smoothstep(0.55, 0.75, n2(q * 0.08)) * 0.6);
+    \\        col = mix(col, padCol, pad);
+    \\    }
     \\    // micro detail, faded with distance to avoid shimmering
-    \\    float dv = length(p - viewPos);
-    \\    float micro = n2(q * 4.3) * 0.55 + n2(q * 14.0) * 0.45;
-    \\    col *= mix(0.8 + 0.4 * micro, 1.0, smoothstep(40.0, 400.0, dv));
+    \\    if (dv < 400.0) {
+    \\        float micro = n2(q * 4.3) * 0.55 + n2(q * 14.0) * 0.45;
+    \\        col *= mix(0.8 + 0.4 * micro, 1.0, smoothstep(40.0, 400.0, dv));
+    \\    }
     \\    return pow(col, vec3(2.2));
     \\}
     \\float shadow(vec3 n) {
@@ -243,4 +251,17 @@ pub const part_fs =
     \\    vec4 t = texture(texture0, fragTexCoord);
     \\    finalColor = t * fragColor;
     \\}
+;
+
+/// Shadow pass: depth only, no shading.
+pub const depth_vs =
+    \\#version 330
+    \\in vec3 vertexPosition;
+    \\uniform mat4 mvp;
+    \\void main() { gl_Position = mvp * vec4(vertexPosition, 1.0); }
+;
+pub const depth_fs =
+    \\#version 330
+    \\out vec4 finalColor;
+    \\void main() { finalColor = vec4(1.0); }
 ;

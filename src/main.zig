@@ -389,7 +389,8 @@ const Settings = extern struct {
     invertY: u8 = 0,
     hidpi: u8 = 0,
     diff: u8 = 1, // 0 easy, 1 normal, 2 hard
-    pad: [2]u8 = .{ 0, 0 },
+    novsync: u8 = 0, // 0 = vsync on
+    rscale: u8 = 0, // render scale: 0 100%, 1 85%, 2 70%, 3 50%
 };
 const Records = extern struct {
     defWave: i32 = 0,
@@ -490,6 +491,14 @@ var parts: [MAX_PART]Part = [_]Part{.{}} ** MAX_PART;
 var partHead: usize = 0;
 var trees: [MAX_TREES]Tree = undefined;
 var ntrees: usize = 0;
+
+// Trees never move: they are merged into static meshes per 500 m cell, so the whole
+// forest is a few dozen draw calls instead of one per tree.
+const CHUNK: f32 = 500;
+const TreeChunk = struct { mesh: c.Mesh, center: V3, radius: f32 };
+var treeChunks: [1100]TreeChunk = undefined;
+var nTreeChunks: usize = 0;
+var treeMat: c.Material = undefined;
 var props: [MAX_PROPS]Prop = undefined;
 var nprops: usize = 0;
 var objs: [3]Obj = undefined;
@@ -754,7 +763,7 @@ fn initShaders() void {
     setV3(sky, c.GetShaderLocation(sky, "zenithColor"), zenithColor);
     skyTime = c.GetShaderLocation(sky, "time");
     skyView = c.GetShaderLocation(sky, "viewPos");
-    setF(lit, L.shadowTexel, 1.0 / @as(f32, SHADOW_SIZE));
+    depthSh = c.LoadShaderFromMemory(sh.depth_vs, sh.depth_fs);
     setF(lit, L.emissive, 0);
     setI(lit, L.isTerrain, 0);
     const roads = [_]f32{
@@ -781,20 +790,146 @@ fn setI(s: c.Shader, loc: c_int, v: c_int) void {
     c.SetShaderValue(s, loc, &v, c.SHADER_UNIFORM_INT);
 }
 
+/// Material colour as a vertex colour: the lit shader does colDiffuse * pow(vc, 2.2).
+fn matVertexColor(m: c.Material) [3]u8 {
+    const cc = m.maps[c.MATERIAL_MAP_DIFFUSE].color;
+    var out: [3]u8 = undefined;
+    for ([_]u8{ cc.r, cc.g, cc.b }, 0..) |v, k| out[k] = @intFromFloat(@round(std.math.pow(f32, @as(f32, @floatFromInt(v)) / 255, 1.0 / 2.2) * 255));
+    return out;
+}
+
+fn buildTreeChunks() void {
+    const n: usize = @intFromFloat(16000 / CHUNK);
+    treeMat = c.LoadMaterialDefault();
+    treeMat.shader = lit;
+    treeMat.maps[c.MATERIAL_MAP_DIFFUSE].color = WHITE;
+    nTreeChunks = 0;
+    var cz: usize = 0;
+    while (cz < n) : (cz += 1) {
+        var cx: usize = 0;
+        while (cx < n) : (cx += 1) {
+            const x0 = -8000 + @as(f32, @floatFromInt(cx)) * CHUNK;
+            const z0 = -8000 + @as(f32, @floatFromInt(cz)) * CHUNK;
+            // count vertices
+            var vc: usize = 0;
+            var i: usize = 0;
+            while (i < ntrees) : (i += 1) {
+                const t = trees[i];
+                if (t.pos.x < x0 or t.pos.x >= x0 + CHUNK or t.pos.z < z0 or t.pos.z >= z0 + CHUNK) continue;
+                const md = if (t.pine) M.pine else M.leaf;
+                var k: usize = 0;
+                while (k < @as(usize, @intCast(md.meshCount))) : (k += 1) vc += @as(usize, @intCast(md.meshes[k].triangleCount)) * 3;
+            }
+            if (vc == 0 or nTreeChunks >= treeChunks.len) continue;
+            var mesh = std.mem.zeroes(c.Mesh);
+            mesh.vertexCount = @intCast(vc);
+            mesh.triangleCount = @intCast(vc / 3);
+            mesh.vertices = @ptrCast(@alignCast(c.MemAlloc(@intCast(vc * 3 * 4))));
+            mesh.normals = @ptrCast(@alignCast(c.MemAlloc(@intCast(vc * 3 * 4))));
+            mesh.colors = @ptrCast(c.MemAlloc(@intCast(vc * 4)));
+            var w: usize = 0;
+            var ymin: f32 = 1e9;
+            var ymax: f32 = -1e9;
+            i = 0;
+            while (i < ntrees) : (i += 1) {
+                const t = trees[i];
+                if (t.pos.x < x0 or t.pos.x >= x0 + CHUNK or t.pos.z < z0 or t.pos.z >= z0 + CHUNK) continue;
+                const md = if (t.pine) M.pine else M.leaf;
+                // same transform as DrawModelEx(pos, axis Y, yaw degrees, scale)
+                const a = t.yaw * vm.deg;
+                const ca = @cos(a);
+                const sa = @sin(a);
+                var k: usize = 0;
+                while (k < @as(usize, @intCast(md.meshCount))) : (k += 1) {
+                    const me = md.meshes[k];
+                    const colr = matVertexColor(md.materials[@intCast(md.meshMaterial[k])]);
+                    const nt: usize = @as(usize, @intCast(me.triangleCount)) * 3;
+                    var j: usize = 0;
+                    while (j < nt) : (j += 1) {
+                        const vi: usize = if (me.indices != null) me.indices[j] else j;
+                        const px = me.vertices[vi * 3] * t.s;
+                        const py = me.vertices[vi * 3 + 1] * t.s;
+                        const pz = me.vertices[vi * 3 + 2] * t.s;
+                        const nx = me.normals[vi * 3];
+                        const ny = me.normals[vi * 3 + 1];
+                        const nz = me.normals[vi * 3 + 2];
+                        mesh.vertices[w * 3] = t.pos.x + px * ca + pz * sa;
+                        mesh.vertices[w * 3 + 1] = t.pos.y + py;
+                        mesh.vertices[w * 3 + 2] = t.pos.z - px * sa + pz * ca;
+                        mesh.normals[w * 3] = nx * ca + nz * sa;
+                        mesh.normals[w * 3 + 1] = ny;
+                        mesh.normals[w * 3 + 2] = -nx * sa + nz * ca;
+                        mesh.colors[w * 4] = colr[0];
+                        mesh.colors[w * 4 + 1] = colr[1];
+                        mesh.colors[w * 4 + 2] = colr[2];
+                        mesh.colors[w * 4 + 3] = 255;
+                        ymin = @min(ymin, t.pos.y + py);
+                        ymax = @max(ymax, t.pos.y + py);
+                        w += 1;
+                    }
+                }
+            }
+            c.UploadMesh(&mesh, false);
+            const hc = CHUNK * 0.5;
+            treeChunks[nTreeChunks] = .{
+                .mesh = mesh,
+                .center = v3(x0 + hc, (ymin + ymax) / 2, z0 + hc),
+                .radius = @sqrt(2 * hc * hc + (ymax - ymin) * (ymax - ymin) / 4) + 15,
+            };
+            nTreeChunks += 1;
+        }
+    }
+}
+
+var shadowSize: c_int = SHADOW_SIZE;
+
+fn shadowSizeFor(q: u8) c_int {
+    return if (q == 2) 1024 else SHADOW_SIZE;
+}
+
 fn initShadow() void {
+    initShadowSize(shadowSizeFor(save.settings.shadows));
+}
+
+fn initShadowSize(size: c_int) void {
+    shadowSize = size;
     const fbo = c.rlLoadFramebuffer();
-    const depth = c.rlLoadTextureDepth(SHADOW_SIZE, SHADOW_SIZE, false);
+    const depth = c.rlLoadTextureDepth(size, size, false);
     c.rlFramebufferAttach(fbo, depth, c.RL_ATTACHMENT_DEPTH, c.RL_ATTACHMENT_TEXTURE2D, 0);
     if (!c.rlFramebufferComplete(fbo)) std.debug.print("shadow fbo incomplete\n", .{});
     shadowRT = std.mem.zeroes(c.RenderTexture2D);
     shadowRT.id = fbo;
-    shadowRT.texture.width = SHADOW_SIZE;
-    shadowRT.texture.height = SHADOW_SIZE;
+    shadowRT.texture.width = size;
+    shadowRT.texture.height = size;
     shadowRT.depth.id = depth;
-    shadowRT.depth.width = SHADOW_SIZE;
-    shadowRT.depth.height = SHADOW_SIZE;
+    shadowRT.depth.width = size;
+    shadowRT.depth.height = size;
     shadowRT.depth.format = 19;
     shadowRT.depth.mipmaps = 1;
+    setF(lit, L.shadowTexel, 1.0 / @as(f32, @floatFromInt(size)));
+}
+
+/// Shadow quality changed in settings: rebuild the depth target at the new size.
+fn reloadShadow() void {
+    const want = shadowSizeFor(save.settings.shadows);
+    if (want == shadowSize) return;
+    c.rlUnloadFramebuffer(shadowRT.id);
+    c.rlUnloadTexture(shadowRT.depth.id);
+    initShadowSize(want);
+}
+
+var depthSh: c.Shader = undefined;
+
+/// Swap every prop model's shader (lit for colour, depth-only for the shadow pass).
+fn setPropShader(shd: c.Shader) void {
+    inline for (std.meta.fields(Models)) |f| {
+        if (comptime !std.mem.eql(u8, f.name, "terrain") and !std.mem.eql(u8, f.name, "sky")) {
+            const m = @field(M, f.name);
+            var i: usize = 0;
+            while (i < @as(usize, @intCast(m.materialCount))) : (i += 1) m.materials[i].shader = shd;
+        }
+    }
+    treeMat.shader = shd;
 }
 
 fn initFont() void {
@@ -2396,23 +2531,20 @@ var camFwdG: V3 = v3(1, 0, 0);
 
 fn drawScene(camPos: V3, shadowPass: bool, focus: V3) void {
     // fog makes anything past ~3.5 km invisible anyway
-    const maxD2: f32 = if (shadowPass) 450 * 450 else 3600 * 3600;
     const ref = if (shadowPass) focus else camPos;
-    // trees
-    var i: usize = 0;
-    while (i < ntrees) : (i += 1) {
-        const t = trees[i];
-        const dx = t.pos.x - ref.x;
-        const dz = t.pos.z - ref.z;
-        const d2 = dx * dx + dz * dz;
-        if (d2 > maxD2) continue;
-        // cheap view-cone cull (skip trees behind the camera)
-        if (!shadowPass and d2 > 60 * 60) {
-            const inv = 1 / @sqrt(d2);
-            if (dx * inv * camFwdG.x + dz * inv * camFwdG.z < 0.35) continue;
-        }
-        c.DrawModelEx(if (t.pine) M.pine else M.leaf, t.pos, v3(0, 1, 0), t.yaw, v3(t.s, t.s, t.s), WHITE);
+    // trees: static chunks
+    const ident = c.Matrix{ .m0 = 1, .m5 = 1, .m10 = 1, .m15 = 1 };
+    const reach: f32 = if (shadowPass) 450 else 3600;
+    for (treeChunks[0..nTreeChunks]) |*tc| {
+        const dx = tc.center.x - ref.x;
+        const dz = tc.center.z - ref.z;
+        const d = @sqrt(dx * dx + dz * dz);
+        if (d - tc.radius > reach) continue;
+        // skip chunks fully behind the camera
+        if (!shadowPass and dx * camFwdG.x + dz * camFwdG.z < -tc.radius) continue;
+        c.DrawMesh(tc.mesh, treeMat, ident);
     }
+    var i: usize = 0;
     // props (generated meshes: draw double-sided, the shader flips back-face normals)
     c.rlDisableBackfaceCulling();
     defer c.rlEnableBackfaceCulling();
@@ -2560,7 +2692,12 @@ fn renderShadow(focus: V3) c.Matrix {
     c.BeginMode3D(lc);
     const view = c.rlGetMatrixModelview();
     const proj = c.rlGetMatrixProjection();
-    if (save.settings.shadows == 1) drawScene(center, true, center);
+    if (save.settings.shadows != 0) {
+        // depth-only: the full lit shader would run fog/shadow maths for nothing
+        setPropShader(depthSh);
+        drawScene(center, true, center);
+        setPropShader(lit);
+    }
     c.EndMode3D();
     c.EndTextureMode();
     c.rlSetClipPlanes(1.0, 30000);
@@ -2572,15 +2709,18 @@ fn camFwdFlat(cam: c.Camera3D) V3 {
     return vm.norm(v3(f.x, 0, f.z));
 }
 
-fn render(cam: c.Camera3D) void {
-    const focus = if (g.follow != 0) g.followEnd else if (g.gunner) vm.mad(cam.position, camFwdFlat(cam), 120) else if (g.camMode == 0 and mode == .defense and app != .menu) g.camFocus else g.camLook;
-    const lightVP = renderShadow(focus);
-    {
-        const f = vm.sub(cam.target, cam.position);
-        camFwdG = vm.norm(v3(f.x, 0, f.z));
-    }
+var sceneRT: c.RenderTexture2D = std.mem.zeroes(c.RenderTexture2D);
 
-    c.BeginDrawing();
+fn renderScale() f32 {
+    return switch (save.settings.rscale) {
+        1 => 0.85,
+        2 => 0.7,
+        3 => 0.5,
+        else => 1,
+    };
+}
+
+fn draw3D(cam: c.Camera3D, focus: V3, lightVP: c.Matrix) void {
     c.ClearBackground(colf(fogDisp[0], fogDisp[1], fogDisp[2], 1));
     c.rlSetClipPlanes(1.0, 30000);
     c.BeginMode3D(cam);
@@ -2613,6 +2753,37 @@ fn render(cam: c.Camera3D) void {
     drawParts(cam);
     if (save.settings.rain == 1) drawRain(cam);
     c.EndMode3D();
+}
+
+fn render(cam: c.Camera3D) void {
+    const focus = if (g.follow != 0) g.followEnd else if (g.gunner) vm.mad(cam.position, camFwdFlat(cam), 120) else if (g.camMode == 0 and mode == .defense and app != .menu) g.camFocus else g.camLook;
+    const lightVP = renderShadow(focus);
+    {
+        const f = vm.sub(cam.target, cam.position);
+        camFwdG = vm.norm(v3(f.x, 0, f.z));
+    }
+
+    const scale = renderScale();
+    if (scale < 0.999) {
+        // render the 3D scene at reduced resolution, then upscale; HUD stays sharp
+        const w: c_int = @intFromFloat(@as(f32, @floatFromInt(c.GetRenderWidth())) * scale);
+        const h: c_int = @intFromFloat(@as(f32, @floatFromInt(c.GetRenderHeight())) * scale);
+        if (sceneRT.id == 0 or sceneRT.texture.width != w or sceneRT.texture.height != h) {
+            if (sceneRT.id != 0) c.UnloadRenderTexture(sceneRT);
+            sceneRT = c.LoadRenderTexture(w, h);
+            c.SetTextureFilter(sceneRT.texture, c.TEXTURE_FILTER_BILINEAR);
+        }
+        c.BeginTextureMode(sceneRT);
+        draw3D(cam, focus, lightVP);
+        c.EndTextureMode();
+        c.BeginDrawing();
+        const tw: f32 = @floatFromInt(w);
+        const th: f32 = @floatFromInt(h);
+        c.DrawTexturePro(sceneRT.texture, .{ .x = 0, .y = 0, .width = tw, .height = -th }, .{ .x = 0, .y = 0, .width = @floatFromInt(c.GetScreenWidth()), .height = @floatFromInt(c.GetScreenHeight()) }, vm.v2(0, 0), 0, WHITE);
+    } else {
+        c.BeginDrawing();
+        draw3D(cam, focus, lightVP);
+    }
 
     switch (app) {
         .playing => if (mode == .attack) drawHudAttack(cam) else if (g.gunner) drawHudGunner(cam) else drawHud(cam),
@@ -2626,7 +2797,8 @@ fn render(cam: c.Camera3D) void {
     if (debugShadow) {
         var t = shadowRT.depth;
         t.format = c.PIXELFORMAT_UNCOMPRESSED_R32;
-        c.DrawTexturePro(t, .{ .x = 0, .y = 0, .width = SHADOW_SIZE, .height = SHADOW_SIZE }, .{ .x = 300, .y = 150, .width = 500, .height = 500 }, vm.v2(0, 0), 0, WHITE);
+        const ss: f32 = @floatFromInt(shadowSize);
+        c.DrawTexturePro(t, .{ .x = 0, .y = 0, .width = ss, .height = ss }, .{ .x = 300, .y = 150, .width = 500, .height = 500 }, vm.v2(0, 0), 0, WHITE);
     }
     c.EndDrawing();
 }
@@ -3311,25 +3483,42 @@ fn drawMenus() void {
             const st = &save.settings;
             const sensNames = [_][*c]const u8{ "Чувствительность мыши: низкая", "Чувствительность мыши: средняя", "Чувствительность мыши: высокая", "Чувствительность мыши: макс" };
             const diffNames = [_][*c]const u8{ "Сложность: лёгкая", "Сложность: нормальная", "Сложность: тяжёлая" };
+            const shadowNames = [_][*c]const u8{ "Тени: выкл", "Тени: высокие", "Тени: низкие" };
+            const scaleNames = [_][*c]const u8{ "Масштаб рендера: 100%", "Масштаб рендера: 85%", "Масштаб рендера: 70%", "Масштаб рендера: 50%" };
             const items = [_][*c]const u8{
                 diffNames[@min(st.diff, 2)],
                 if (st.rain == 1) "Дождь: вкл" else "Дождь: выкл",
-                if (st.shadows == 1) "Тени: вкл" else "Тени: выкл",
+                shadowNames[@min(st.shadows, 2)],
                 sensNames[@min(st.sens, 3)],
                 if (st.invertY == 1) "Инверсия Y: вкл" else "Инверсия Y: выкл",
                 if (st.hidpi == 1) "Retina-разрешение: вкл (тяжело)" else "Retina-разрешение: выкл",
+                scaleNames[@min(st.rscale, 3)],
+                if (st.novsync == 0) "VSync: вкл" else "VSync: выкл",
                 "Назад",
             };
-            const en = [_]bool{ true, true, true, true, true, true, true };
-            txt("Retina применяется после перезапуска", lx, ly + 7 * 50 + 6, 14, HUD_DIM);
+            const en = [_]bool{ true, true, true, true, true, true, true, true, true };
+            txt("Retina применяется после перезапуска", lx, ly + 9 * 50 + 6, 14, HUD_DIM);
             if (menuList(&items, &en, lx, ly, lw)) |i| {
                 switch (i) {
                     0 => st.diff = (st.diff + 1) % 3,
                     1 => st.rain ^= 1,
-                    2 => st.shadows ^= 1,
+                    2 => {
+                        // off -> low -> high -> off
+                        st.shadows = switch (st.shadows) {
+                            0 => 2,
+                            2 => 1,
+                            else => 0,
+                        };
+                        reloadShadow();
+                    },
                     3 => st.sens = (st.sens + 1) % 4,
                     4 => st.invertY ^= 1,
                     5 => st.hidpi ^= 1,
+                    6 => st.rscale = (st.rscale + 1) % 4,
+                    7 => {
+                        st.novsync ^= 1;
+                        if (st.novsync == 0) c.SetWindowState(c.FLAG_VSYNC_HINT) else c.ClearWindowState(c.FLAG_VSYNC_HINT);
+                    },
                     else => {
                         app = appPrev;
                         menuSel = 0;
@@ -3449,7 +3638,8 @@ pub fn main() void {
     // launched from Finder/Explorer: run next to the executable so assets and saves are found
     if (!c.DirectoryExists("assets")) _ = c.ChangeDirectory(c.GetApplicationDirectory());
     loadSave();
-    var flags: c_uint = c.FLAG_MSAA_4X_HINT | c.FLAG_WINDOW_RESIZABLE | c.FLAG_VSYNC_HINT;
+    var flags: c_uint = c.FLAG_MSAA_4X_HINT | c.FLAG_WINDOW_RESIZABLE;
+    if (save.settings.novsync == 0 and c.getenv("PVO_NOVSYNC") == null) flags |= c.FLAG_VSYNC_HINT;
     if (save.settings.hidpi == 1 or c.getenv("PVO_HIDPI") != null) flags |= c.FLAG_WINDOW_HIGHDPI;
     c.SetConfigFlags(flags);
     c.SetTraceLogLevel(c.LOG_WARNING);
@@ -3494,12 +3684,22 @@ pub fn main() void {
     M.sky.materials[0].shader = sky;
 
     initWorld();
+    buildTreeChunks();
     goMenu();
     g.autoSam = true;
 
+    // benchmark overrides
+    if (c.getenv("PVO_RSCALE")) |e| save.settings.rscale = @intCast(c.atoi(e));
+    if (c.getenv("PVO_SHQ")) |e| {
+        save.settings.shadows = @intCast(c.atoi(e));
+        reloadShadow();
+    }
     const sceneEnv = c.getenv("PVO_SCENE");
     const scene: c_int = if (sceneEnv != null) c.atoi(sceneEnv) else 0;
-    if (shotFrames > 0 and scene == 4) {
+    if (shotFrames > 0 and scene == 5) {
+        app = .settings;
+        appPrev = .menu;
+    } else if (shotFrames > 0 and scene == 4) {
         app = .playing;
         g.wave = 1;
         g.waveBearing = 0.4;
@@ -3576,6 +3776,7 @@ pub fn main() void {
     }
 
     var frame: i32 = 0;
+    var benchT0: f64 = 0;
     const followEnv = c.getenv("PVO_FOLLOW");
     const followAt: i32 = if (followEnv != null) c.atoi(followEnv) else 0;
     while (!quit and !c.WindowShouldClose()) {
@@ -3624,12 +3825,15 @@ pub fn main() void {
         }
         render(cam);
         frame += 1;
+        if (shotFrames > 200 and frame == shotFrames - 200) benchT0 = c.GetTime();
         if (shotFrames > 0 and frame == shotFrames) {
+            if (shotFrames > 200) std.debug.print("BENCH {d:.1} fps avg over 200 frames\n", .{200.0 / (c.GetTime() - benchT0)});
             const rw = c.GetRenderWidth();
             const rh = c.GetRenderHeight();
             var img = c.Image{ .data = c.rlReadScreenPixels(rw, rh), .width = rw, .height = rh, .mipmaps = 1, .format = c.PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
             if (rw > 2000) c.ImageResize(&img, @divTrunc(rw, 2), @divTrunc(rh, 2));
-            std.debug.print("FPS {d} render {d}x{d}\n", .{ c.GetFPS(), rw, rh });
+            const dpi = c.GetWindowScaleDPI();
+            std.debug.print("FPS {d} render {d}x{d} screen {d}x{d} dpi {d:.2}\n", .{ c.GetFPS(), rw, rh, c.GetScreenWidth(), c.GetScreenHeight(), dpi.x });
             _ = c.ExportImage(img, "shot.png");
             c.UnloadImage(img);
             break;

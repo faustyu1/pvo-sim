@@ -78,8 +78,13 @@ Settings, records and the saved game are stored in `pvo_save.dat` next to the ga
 ## Settings
 
 - Difficulty (easy / normal / hard). In defence it scales wave size, enemy speed and missile resupply. In attack it scales radar detection range, how long the AI needs to lock on, the pause between launches, missile and gun hit chance, and drone durability (10 / 6 / 3 hits).
-- Rain, shadows, mouse sensitivity, Y inversion.
-- Retina resolution, which takes effect after a restart. It is heavier on the GPU (about 40 FPS versus about 100 FPS at normal resolution).
+- Rain, mouse sensitivity, Y inversion.
+- Shadows: off, low (1024 shadow map) or high (2048).
+- Render scale (100 / 85 / 70 / 50 %): the 3D scene is rendered at reduced resolution and upscaled, while the HUD stays sharp. Useful with Retina.
+- VSync. When it is on, FPS is capped at the display refresh rate (60 or 120 Hz).
+- Retina resolution, which takes effect after a restart.
+
+On an Apple Silicon Mac with VSync off the game runs at about 300 FPS at normal resolution and about 140 FPS on Retina (160–180 with render scale 70–50 %).
 
 ## Third-party
 
