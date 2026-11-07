@@ -255,6 +255,7 @@ const Shell = struct {
     fuse: f32 = 0,
     t: f32 = 0,
     tracer: bool = false,
+    id: u32 = 0,
 };
 
 const Part = struct {
@@ -329,6 +330,19 @@ const Game = struct {
     gTrigger: bool = false,
     gRange: f32 = 1500, // fuse range from the laser rangefinder
     gLock: i32 = -1, // target nearest the boresight
+
+    // projectile follow camera: click a SAM or a tracer to ride along with it
+    follow: u8 = 0, // 0 off, 1 SAM, 2 shell
+    followIdx: usize = 0,
+    followId: u32 = 0,
+    followNose: bool = false,
+    followDist: f32 = 16,
+    followDir: V3 = v3(1, 0, 0),
+    followEnd: V3 = vm.zero,
+    followDead: bool = false,
+    followEndT: f32 = 0,
+    followT: f32 = 0,
+    followTgt: u32 = 0,
 
     rYaw: f32 = 0,
 
@@ -1842,6 +1856,147 @@ fn gunnerInput() void {
     if (c.IsKeyPressed(c.KEY_N) and g.toSpawn == 0 and g.waveT > 1) g.waveT = 0.5;
 }
 
+const Followed = struct { pos: V3, vel: V3, t: f32 };
+
+fn followed() ?Followed {
+    switch (g.follow) {
+        1 => {
+            const m = &missiles[g.followIdx];
+            if (m.alive and m.id == g.followId) return .{ .pos = m.pos, .vel = m.vel, .t = m.t };
+        },
+        2 => {
+            const shl = &shells[g.followIdx];
+            if (shl.alive and shl.id == g.followId) return .{ .pos = shl.pos, .vel = shl.vel, .t = shl.t };
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn startFollow(kind: u8, idx: usize) void {
+    g.follow = kind;
+    g.followIdx = idx;
+    g.followDead = false;
+    g.followNose = false;
+    if (kind == 1) {
+        const m = &missiles[idx];
+        g.followId = m.id;
+        g.followDir = vm.norm(m.vel);
+        g.followDist = 16;
+        g.followTgt = m.tgtId;
+        msg(c.TextFormat("Слежение: ЗУР #%d", @as(c_int, @intCast(m.id + 1))), HUD);
+    } else {
+        const shl = &shells[idx];
+        shl.tracer = true; // the followed round always glows
+        g.followId = shl.id;
+        g.followDir = vm.norm(shl.vel);
+        g.followDist = 2.5;
+        msg("Слежение: снаряд 35 мм (замедление)", HUD);
+    }
+}
+
+fn stopFollow() void {
+    g.follow = 0;
+    g.camMode = 0;
+    g.camFocus = v3(g.camPos.x, heightAt(g.camPos.x, g.camPos.z) + 8, g.camPos.z);
+    g.camFocus = vm.lerp(g.camFocus, v3(g.followEnd.x, heightAt(g.followEnd.x, g.followEnd.z) + 8, g.followEnd.z), 0.5);
+}
+
+/// Newest live SAM, else the newest shell in flight.
+fn followNewest() void {
+    var best: i32 = -1;
+    var bt: f32 = 1e9;
+    for (&missiles, 0..) |*m, i| {
+        if (m.alive and m.t < bt) {
+            bt = m.t;
+            best = @intCast(i);
+        }
+    }
+    if (best >= 0) return startFollow(1, @intCast(best));
+    for (&shells, 0..) |*shl, i| {
+        if (shl.alive and shl.t < bt) {
+            bt = shl.t;
+            best = @intCast(i);
+        }
+    }
+    if (best >= 0) startFollow(2, @intCast(best)) else msg("Нет ракет и снарядов в полёте", HUD_DIM);
+}
+
+/// Simulation time scale: following a shell runs in slow motion.
+fn timeScale() f32 {
+    return if (g.follow == 2 and !g.followDead) 0.12 else 1;
+}
+
+fn followInput() void {
+    if (c.IsKeyPressed(c.KEY_C)) g.followNose = !g.followNose;
+    const wheel = c.GetMouseWheelMove();
+    g.followDist = vm.clampf(g.followDist * @exp(-wheel * 0.12), 0.8, 120);
+    if (c.IsKeyPressed(c.KEY_BACKSPACE) or c.IsKeyPressed(c.KEY_H) or c.IsMouseButtonPressed(c.MOUSE_BUTTON_RIGHT)) stopFollow();
+    if (c.IsKeyPressed(c.KEY_B)) followNewest();
+}
+
+fn followCamera(dtReal: f32) c.Camera3D {
+    if (followed()) |f| {
+        const d = vm.norm(f.vel);
+        g.followDir = vm.norm(vm.lerp(g.followDir, d, @min(1, 10 * dtReal)));
+        g.followEnd = f.pos;
+        g.followT = f.t;
+        if (g.followNose) {
+            const nose: f32 = if (g.follow == 1) 3.2 else 0.4;
+            g.camPos = vm.mad(f.pos, d, nose);
+            g.camLook = vm.mad(f.pos, d, 200);
+            return .{ .position = g.camPos, .target = g.camLook, .up = v3(0, 1, 0), .fovy = 60, .projection = c.CAMERA_PERSPECTIVE };
+        }
+        const lift: f32 = if (g.follow == 1) 0.4 else 0.22;
+        var pos = vm.add(vm.mad(f.pos, g.followDir, -g.followDist), v3(0, g.followDist * lift + 0.4, 0));
+        pos.y = @max(pos.y, heightAt(pos.x, pos.z) + 1.5);
+        g.camPos = pos;
+        g.camLook = vm.mad(f.pos, g.followDir, g.followDist * 1.2);
+        return .{ .position = g.camPos, .target = g.camLook, .up = v3(0, 1, 0), .fovy = 62, .projection = c.CAMERA_PERSPECTIVE };
+    }
+    // object gone (hit, burst or fell): hold the view on where it ended, then drop back
+    if (!g.followDead) {
+        g.followDead = true;
+        g.followEndT = 3.0;
+        g.camYaw = vm.yawOf(g.followDir) + vm.pi * 0.5;
+    }
+    g.followEndT -= dtReal;
+    g.camYaw += dtReal * 0.3;
+    const r: f32 = 70;
+    var pos = vm.add(g.followEnd, v3(@cos(g.camYaw) * r, 22, -@sin(g.camYaw) * r));
+    pos.y = @max(pos.y, heightAt(pos.x, pos.z) + 3);
+    g.camPos = vm.lerp(g.camPos, pos, @min(1, 3 * dtReal));
+    g.camLook = vm.lerp(g.camLook, g.followEnd, @min(1, 6 * dtReal));
+    if (g.followEndT <= 0) stopFollow();
+    return .{ .position = g.camPos, .target = g.camLook, .up = v3(0, 1, 0), .fovy = 58, .projection = c.CAMERA_PERSPECTIVE };
+}
+
+fn drawFollowHud(W: f32, H: f32) void {
+    const x: f32 = W / 2 - 170;
+    const y: f32 = H - 132;
+    c.DrawRectangleRounded(.{ .x = x, .y = y, .width = 340, .height = 96 }, 0.08, 6, PANEL);
+    if (followed()) |f| {
+        const spd = vm.len(f.vel);
+        const agl = f.pos.y - heightAt(f.pos.x, f.pos.z);
+        if (g.follow == 1) {
+            txt(c.TextFormat("ЗУР #%d", @as(c_int, @intCast(g.followId + 1))), x + 12, y + 8, 18, HUD);
+            const ti = findById(g.followTgt);
+            if (ti >= 0) {
+                const d = vm.dist(targets[@intCast(ti)].pos, f.pos);
+                txt(c.TextFormat("до цели %d м   встреча ~%.1f с", @as(c_int, @intFromFloat(d)), @as(f64, d / @max(spd, 1))), x + 12, y + 54, 16, HUD_AMBER);
+            } else txt("цель потеряна", x + 12, y + 54, 16, HUD_RED);
+        } else {
+            txt("СНАРЯД 35 мм   замедление x8", x + 12, y + 8, 18, HUD);
+            const shl = &shells[g.followIdx];
+            txt(c.TextFormat("подрыв через %.2f с", @as(f64, @max(0, shl.fuse - shl.t))), x + 12, y + 54, 16, HUD_AMBER);
+        }
+        txt(c.TextFormat("%d м/с   высота %d м   полёт %.1f с", @as(c_int, @intFromFloat(spd)), @as(c_int, @intFromFloat(agl)), @as(f64, f.t)), x + 12, y + 32, 16, HUD);
+    } else {
+        txt(if (g.follow == 1) "ЗУР: подрыв" else "Снаряд: подрыв", x + 12, y + 8, 18, HUD_AMBER);
+    }
+    txt("C — вид из носа · колесо — дистанция · ПКМ/H — выход · B — следующий", x + 12, y + 76, 13, HUD_DIM);
+}
+
 fn gunnerCamera() c.Camera3D {
     const eye = gunnerEye();
     g.camPos = eye;
@@ -1862,7 +2017,7 @@ fn fireShell(tof: f32) void {
     const dir = vm.norm(vm.add(xf.x, disp));
     for (&shells) |*s| {
         if (s.alive) continue;
-        s.* = .{ .alive = true, .pos = muzzle, .vel = vm.scale(dir, SHELL_SPEED), .fuse = tof + vm.rr(-0.02, 0.02), .tracer = g.gRound % 2 == 0 };
+        s.* = .{ .alive = true, .pos = muzzle, .vel = vm.scale(dir, SHELL_SPEED), .fuse = tof + vm.rr(-0.02, 0.02), .tracer = g.gRound % 2 == 0, .id = g.gRound };
         break;
     }
     // muzzle flash: a short cone of fire along the barrel plus side jets from the brake
@@ -2031,7 +2186,19 @@ fn scopeRect() Scope {
 }
 
 fn handleInput(cam: c.Camera3D, dtReal: f32) void {
-    if (mode == .defense and c.IsKeyPressed(c.KEY_V)) enterGunner(!g.gunner);
+    if (mode == .defense and c.IsKeyPressed(c.KEY_V)) {
+        g.follow = 0;
+        enterGunner(!g.gunner);
+    }
+    if (g.follow != 0) {
+        followInput();
+        return;
+    }
+    if (mode == .defense and c.IsKeyPressed(c.KEY_B)) {
+        if (g.gunner) enterGunner(false);
+        followNewest();
+        return;
+    }
     if (g.gunner) {
         gunnerInput();
         return;
@@ -2082,6 +2249,36 @@ fn handleInput(cam: c.Camera3D, dtReal: f32) void {
             if (d < bd) {
                 bd = d;
                 best = @intCast(i);
+            }
+        }
+        // projectiles: a click near a SAM or a tracer rides along with it
+        if (!inScope) {
+            var pk: u8 = 0;
+            var pi: usize = 0;
+            var pd: f32 = @min(bd, 34);
+            for (&missiles, 0..) |*m, i| {
+                if (!m.alive or vm.dot(vm.sub(m.pos, cam.position), vm.sub(cam.target, cam.position)) <= 0) continue;
+                const sp = c.GetWorldToScreen(m.pos, cam);
+                const d = @sqrt((sp.x - mp.x) * (sp.x - mp.x) + (sp.y - mp.y) * (sp.y - mp.y));
+                if (d < pd) {
+                    pd = d;
+                    pk = 1;
+                    pi = i;
+                }
+            }
+            for (&shells, 0..) |*shl, i| {
+                if (!shl.alive or !shl.tracer or vm.dot(vm.sub(shl.pos, cam.position), vm.sub(cam.target, cam.position)) <= 0) continue;
+                const sp = c.GetWorldToScreen(shl.pos, cam);
+                const d = @sqrt((sp.x - mp.x) * (sp.x - mp.x) + (sp.y - mp.y) * (sp.y - mp.y));
+                if (d < pd) {
+                    pd = d;
+                    pk = 2;
+                    pi = i;
+                }
+            }
+            if (pk != 0) {
+                startFollow(pk, pi);
+                return;
             }
         }
         if (best >= 0) setSelected(best);
@@ -2152,6 +2349,7 @@ fn menuCamera(dtReal: f32) c.Camera3D {
 fn updateCamera(dtReal: f32) c.Camera3D {
     if (mode == .attack) return attackCamera(dtReal);
     if (g.gunner) return gunnerCamera();
+    if (g.follow != 0) return followCamera(dtReal);
     var focus = g.camFocus;
     var dist = g.camDist;
     var cm = g.camMode;
@@ -2295,6 +2493,16 @@ fn sprite(p: V3, right: V3, up: V3, size: f32, cc: c.Color) void {
     }
 }
 
+fn drawFollowedShell() void {
+    if (g.follow != 2 or g.followDead) return;
+    const shl = &shells[g.followIdx];
+    if (!shl.alive or shl.id != g.followId) return;
+    const d = vm.norm(shl.vel);
+    // 35 mm round: steel body, olive ogive
+    c.DrawCylinderEx(vm.mad(shl.pos, d, -0.2), vm.mad(shl.pos, d, 0.05), 0.0175, 0.0175, 10, col(70, 72, 70, 255));
+    c.DrawCylinderEx(vm.mad(shl.pos, d, 0.05), vm.mad(shl.pos, d, 0.16), 0.0175, 0.002, 10, col(90, 96, 66, 255));
+}
+
 fn drawTracers(cam: c.Camera3D) void {
     const fw = vm.norm(vm.sub(cam.target, cam.position));
     const right = vm.norm(vm.cross(fw, v3(0, 1, 0)));
@@ -2313,6 +2521,13 @@ fn drawTracers(cam: c.Camera3D) void {
         const dist = vm.dist(s.pos, cam.position);
         const f = (1 - fogFactor(s.pos, cam.position) * 0.85) * burn;
         if (f < 0.02) continue;
+        if (g.follow == 2 and s.id == g.followId and !g.followDead) {
+            // ridden round: short burning base instead of a persistence streak
+            const k: f32 = 0.0012;
+            ribbon(cam, s.pos, vm.mad(s.pos, s.vel, -k * 3), 0.09, col(255, 130, 40, 200), col(255, 60, 10, 0));
+            sprite(vm.mad(s.pos, s.vel, -0.0002), right, up, 0.12, col(255, 230, 170, 255));
+            continue;
+        }
         // streak length mimics eye/camera persistence; width keeps it visible far away
         const w = @max(0.14, dist * 0.0014);
         const a1: u8 = @intFromFloat(200 * f);
@@ -2358,7 +2573,7 @@ fn camFwdFlat(cam: c.Camera3D) V3 {
 }
 
 fn render(cam: c.Camera3D) void {
-    const focus = if (g.gunner) vm.mad(cam.position, camFwdFlat(cam), 120) else if (g.camMode == 0 and mode == .defense and app != .menu) g.camFocus else g.camLook;
+    const focus = if (g.follow != 0) g.followEnd else if (g.gunner) vm.mad(cam.position, camFwdFlat(cam), 120) else if (g.camMode == 0 and mode == .defense and app != .menu) g.camFocus else g.camLook;
     const lightVP = renderShadow(focus);
     {
         const f = vm.sub(cam.target, cam.position);
@@ -2393,6 +2608,7 @@ fn render(cam: c.Camera3D) void {
     setI(lit, L.isTerrain, 0);
 
     drawScene(cam.position, false, focus);
+    drawFollowedShell();
     drawTracers(cam);
     drawParts(cam);
     if (save.settings.rain == 1) drawRain(cam);
@@ -2509,9 +2725,10 @@ fn drawHud(cam: c.Camera3D) void {
     drawScope();
     drawTrackTable(W);
     drawWeapons(W, H);
+    if (g.follow != 0) drawFollowHud(W, H);
 
     // ---- help line
-    const help = "ПКМ — вращение   Колесо — зум   WASD — смещение   TAB/клик — цель   F/Пробел — пуск ЗУР   T — авто-ЗРК   G — ЗСУ   V — наводчик ЗСУ   C — камера   X — ускорение   P — пауза";
+    const help = "ПКМ — вращение   Колесо — зум   WASD — смещение   TAB/клик — цель   F/Пробел — пуск ЗУР   T — авто-ЗРК   G — ЗСУ   V — наводчик ЗСУ   B/клик по ракете — слежение   C — камера   X — ускорение   P — пауза";
     const hw = txtW(help, 14);
     c.DrawRectangleRounded(.{ .x = W / 2 - hw / 2 - 12, .y = H - 26, .width = hw + 24, .height = 21 }, 0.4, 4, PANEL);
     txtC(help, W / 2, H - 23, 14, HUD_DIM);
@@ -3359,6 +3576,8 @@ pub fn main() void {
     }
 
     var frame: i32 = 0;
+    const followEnv = c.getenv("PVO_FOLLOW");
+    const followAt: i32 = if (followEnv != null) c.atoi(followEnv) else 0;
     while (!quit and !c.WindowShouldClose()) {
         const dtReal: f32 = if (shotFrames > 0) 1.0 / 60.0 else @min(c.GetFrameTime(), 0.05);
         renderTime += dtReal;
@@ -3376,7 +3595,7 @@ pub fn main() void {
                     if (!g.paused) {
                         const steps: usize = @intFromFloat(g.warp);
                         var s: usize = 0;
-                        while (s < steps) : (s += 1) update(dtReal);
+                        while (s < steps) : (s += 1) update(dtReal * timeScale());
                     }
                 }
                 cam = updateCamera(dtReal);
@@ -3397,6 +3616,11 @@ pub fn main() void {
                 if (mode == .defense) update(dtReal) else updateParts(dtReal);
                 cam = menuCamera(dtReal);
             },
+        }
+        if (shotFrames > 0 and followAt > 0 and frame == followAt) {
+            g.gunner = false;
+            followNewest();
+            g.followNose = c.getenv("PVO_NOSE") != null;
         }
         render(cam);
         frame += 1;

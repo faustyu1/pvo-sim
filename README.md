@@ -53,6 +53,7 @@ Models are generated procedurally in Blender (ambient occlusion is baked into ve
 - TAB or click: select a target. F or Space: launch a SAM.
 - T: toggle auto-SAM. G: allow or forbid AA-gun fire.
 - V: take the gunner seat.
+- Click a SAM or a tracer in flight (or press B for the newest one) to ride along with it, like the drone camera. C: nose view. Wheel: distance. RMB, H or Backspace: back. Following a shell runs in 8x slow motion.
 - C: cycle camera (overview / missile / target). X: time acceleration. N: start the next wave now.
 
 **Defence, gunner seat**
