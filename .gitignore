@@ -1,0 +1,7 @@
+.zig-cache/
+zig-out/
+zig-out-*/
+pvo_save.dat
+shot.png
+tools/preview.png
+.DS_Store
